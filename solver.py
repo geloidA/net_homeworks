@@ -1,7 +1,6 @@
 import re
-from typing import Any
-
 import requests
+from typing import Any
 
 class UnknownInstructionError(Exception):
     ...
@@ -9,23 +8,19 @@ class UnknownInstructionError(Exception):
 USER_TOKEN = '623b09e1ec6b957fd4ed6a3b9e84685a'
 
 ACTIONS = [
-    ("GET",    re.compile(r'\bGET[- ]?запрос',      re.IGNORECASE)),
-    ("GET",    re.compile(r'Перейдите по', re.IGNORECASE)),
-    ("POST",   re.compile(r'\bPOST[- ]?запрос',     re.IGNORECASE)),
-    ("UPLOAD", re.compile(r'Загрузите\s+файлы',     re.IGNORECASE)),
+    ("GET",     'GET-запрос'),
+    ("GET",     'Перейдите по'),
+    ("POST",    'POST-запрос'),
+    ("UPLOAD",  'Загрузите файлы'),
 ]
 
 TABLE_ROLES = [
-    (re.compile(r'заголовк',                 re.IGNORECASE), "headers"),
-    (re.compile(r'cookie',                   re.IGNORECASE), "cookies"),
-    (re.compile(r'данны[ех]\s+формы',        re.IGNORECASE), "form"),
-    (re.compile(r'параметр[а-я]*\s+запроса', re.IGNORECASE), "params"),
-    (re.compile(r'содержимым',               re.IGNORECASE), "files"),
+    ("headers", 'заголовк'),
+    ("cookies", "cookie"),
+    ("form", "данные формы"),
+    ("params", "параметры запроса"),
+    ("files", "Загрузите файлы"),
 ]
-
-def extract_tables(html: str) -> list[str]:
-    """Возвращает список HTML-фрагментов <table>...</table>."""
-    return re.findall(r'<table\b[^>]*>.*?</table>', html, re.DOTALL | re.IGNORECASE)
 
 
 def parse_table(table_html: str) -> dict:
@@ -35,8 +30,8 @@ def parse_table(table_html: str) -> dict:
 
 
 def detect_action(html: str) -> str:
-    for name, pattern in ACTIONS:
-        if pattern.search(html):
+    for name, text_to_find in ACTIONS:
+        if html.find(text_to_find) != -1:
             return name
     raise UnknownInstructionError(
         "Не удалось распознать действие. Поддерживаются: "
@@ -44,13 +39,9 @@ def detect_action(html: str) -> str:
     )
 
 
-def has_action(html: str) -> bool:
-    return any(p.search(html) for _, p in ACTIONS)
-
-
 def detect_table_role(preceding_text: str) -> str:
-    for pattern, role in TABLE_ROLES:
-        if pattern.search(preceding_text):
+    for role, text_to_find in TABLE_ROLES:
+        if preceding_text.rfind(text_to_find) != -1:
             return role
     raise UnknownInstructionError(
         "Не удалось распознать назначение таблицы. "
@@ -61,12 +52,12 @@ def detect_table_role(preceding_text: str) -> str:
 def extract_url(html: str) -> str:
     """Извлекает URL из инструкции: либо <code>/...</code>, либо <a href="/...">."""
     # Вариант 1: "по адресу <code>/...</code>"
-    m = re.search(r'по\s+адресу\s*<code>(.*?)</code>', html, re.DOTALL | re.IGNORECASE)
+    m = re.search(r'по адресу <code>(.*?)</code>', html, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
     # Вариант 2: "Перейдите по <a href="/...">ссылке</a>"
-    m = re.search(r'<a\s+[^>]*href\s*=\s*["\']?([^"\'>\s]+)["\']?', html, re.IGNORECASE)
+    m = re.search(r'<a href=["\'](.*)["\']', html, re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
@@ -76,13 +67,21 @@ def extract_url(html: str) -> str:
     )
 
 
-def execute(instruction: dict,
-            session: requests.Session,
-            base_url: str) -> requests.Response:
-    action = instruction["action"]
-    url = base_url.rstrip("/") + "/" + instruction["url"].lstrip("/")
+def make_request(url: str,
+                 action: str,
+                 params: dict) -> requests.Response:
+    if action == "GET":
+        return requests.get(url, **params)
+    if action == "POST":
+        return requests.post(url, **params)
+    if action == "UPLOAD":
+        return requests.post(url, **params)
 
-    kwargs: dict = { "cookies": {"user": USER_TOKEN} }
+    raise UnknownInstructionError(f"Неизвестное действие: {action!r}")
+
+
+def get_request_parameters(instruction: dict, action: str) -> dict:
+    kwargs: dict = {"cookies": {"user": USER_TOKEN}}
 
     if "headers" in instruction:
         kwargs["headers"] = instruction["headers"]
@@ -92,21 +91,24 @@ def execute(instruction: dict,
     if "params" in instruction:
         kwargs["params"] = instruction["params"]
 
-    if action == "GET":
-        return session.get(url, **kwargs)
-
     if action == "POST":
         kwargs["data"] = instruction.get("form", {})
-        return session.post(url, **kwargs)
-
     if action == "UPLOAD":
         kwargs["files"] = {
             name: (name, content.encode("utf-8"))
             for name, content in instruction.get("files", {}).items()
         }
-        return session.post(url, **kwargs)
 
-    raise UnknownInstructionError(f"Неизвестное действие: {action!r}")
+    return kwargs
+
+
+def execute(instruction: dict,
+            base_url: str) -> requests.Response:
+    action = instruction["action"]
+    url = base_url.rstrip("/") + "/" + instruction["url"].lstrip("/")
+    params = get_request_parameters(instruction, action)
+
+    return make_request(url, action, params)
 
 
 def parse_instruction(html: str) -> dict:
@@ -125,7 +127,6 @@ def parse_instruction(html: str) -> dict:
 
 
 def process_response(html: str,
-                     session: requests.Session,
                      base_url: str) -> str:
     try:
         instruction = parse_instruction(html)
@@ -135,11 +136,15 @@ def process_response(html: str,
             f"HTML (первые 500 символов): {html[:500]!r}"
         ) from e
 
-    print(f"→ {instruction['action']} {instruction['url']}")
+    print(f"→ {instruction['action']}")
 
-    response = execute(instruction, session, base_url)
+    response = execute(instruction, base_url)
     response.raise_for_status()
     return response.text
+
+
+def has_action(html: str) -> bool:
+    return any(html.find(p) != -1 for _, p in ACTIONS)
 
 
 if __name__ == "__main__":
@@ -147,9 +152,7 @@ if __name__ == "__main__":
     private_token = 'Undefined'
 
     try:
-        session = requests.Session()
-
-        response = session.get(base_url, cookies={"user": USER_TOKEN})
+        response = requests.get(base_url, cookies={"user": USER_TOKEN})
         response.raise_for_status()
         html = response.text
 
@@ -157,9 +160,9 @@ if __name__ == "__main__":
             if not has_action(html):
                 print("=" * 60)
                 print(html)
-
+                break
             print(f"[шаг {step}] ", end='')
-            html = process_response(html, session, base_url)
+            html = process_response(html, base_url)
 
     except UnknownInstructionError as exc:
         print(f"ОШИБКА: {exc}")
